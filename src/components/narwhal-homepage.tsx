@@ -239,7 +239,7 @@ export function NarwhalHomepageComponent() {
         <div className="p-4">
           <div className="flex items-center mb-4 pl-4">
             <svg
-              stroke-width="1.5"
+              strokeWidth="1.5"
               viewBox="0 0 24 24"
               className="w-12 h-12"
             >
@@ -252,7 +252,7 @@ export function NarwhalHomepageComponent() {
               />
               <polyline
                 className="cls-1"
-                points="5.16 8.09 5.19 8.09 12 11.46 12 18.84"
+                points="5.16 8.09 5.19 8.09 12 11.46 12 18.8now4"
               />
               <polyline
                 className="cls-1"
