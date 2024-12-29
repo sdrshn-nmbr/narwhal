@@ -204,12 +204,42 @@ Narwhal is a modern cloud storage platform that combines traditional file storag
 
 4. **AI Service**
    - OpenAI integration for natural language processing
-   - Agent management using CrewAI
-     - File analysis agent
-     - Data extraction agent
-     - Organization agent
-     - Search agent
-   - Workflow orchestration with LangGraph
+   - Agent Architecture:
+     - Main Orchestrator Agent:
+       - Task decomposition
+       - Resource allocation
+       - Progress monitoring
+       - Error recovery
+     - Specialized Worker Agents:
+       - Research Agent (Exa AI + YouTube RAG)
+       - Analysis Agent (Code Interpreter)
+       - Browser Agent (Browserbase)
+       - Document Processing Agent
+     - Safety Mechanisms:
+       - Depth limits for recursive calls
+       - Token budget management
+       - Timeout controls
+       - Circular dependency detection
+     - Agent Coordination:
+       - State machine management via LangGraph
+       - Parallel exploration with CrewAI
+       - Consensus building
+       - Human approval checkpoints
+   - Document Processing Pipeline:
+     - Unstructured for document parsing:
+       - Text extraction
+       - Table detection
+       - Image extraction
+       - Layout analysis
+     - CLIP Integration:
+       - Text-to-Image search
+       - Image-to-Text understanding
+       - Image-to-Image similarity
+       - Visual content organization
+     - Multimodal Embeddings:
+       - Text: ColQwen embeddings
+       - Images: CLIP embeddings (512 dimensions)
+       - Hybrid search capabilities
    - File content analysis and tagging
    - Smart search capabilities
    - Document summarization
@@ -551,6 +581,35 @@ WITH (lists = 100);
 CREATE INDEX idx_vectors_file_chunk ON vectors(file_id, chunk_index);
 ```
 
+### Image Vectors Table
+
+```sql
+CREATE TABLE image_vectors (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    file_id UUID REFERENCES files(id) ON DELETE CASCADE,
+    embedding vector(512) NOT NULL,
+    metadata JSONB DEFAULT '{
+        "type": null,
+        "width": null,
+        "height": null,
+        "format": null,
+        "labels": [],
+        "nsfw_score": 0
+    }',
+    search_config JSONB DEFAULT '{
+        "weight": 1.0,
+        "boost": 1.0,
+        "categories": []
+    }',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Create vector index for CLIP embeddings
+CREATE INDEX idx_image_vectors_embedding ON image_vectors
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+```
+
 ### Agents Table
 
 ```sql
@@ -566,7 +625,7 @@ CREATE TABLE agents (
         "schedule": null,
         "triggers": [],
         "parameters": {},
-        "model": "gpt-4",
+        "model": "gpt-4o",
         "temperature": 0.7
     }',
     state JSONB DEFAULT '{
@@ -914,9 +973,9 @@ class VectorStore:
 
 ```python
 from typing import Dict, List, Optional
-import httpx
 from unstructured.partition.auto import partition
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from sentence_transformers import SentenceTransformer
+import vecs
 
 class DocumentProcessor:
     """Handles document processing and embedding generation."""
@@ -925,11 +984,13 @@ class DocumentProcessor:
         self,
         vector_store: VectorStore,
         colqwen_client: ColQwenEmbeddings,
+        clip_model: Optional[SentenceTransformer] = None,
         chunk_size: int = 1000,
         chunk_overlap: int = 200
     ):
         self.vector_store = vector_store
         self.colqwen = colqwen_client
+        self.clip_model = clip_model or SentenceTransformer('clip-ViT-B-32')
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -945,33 +1006,58 @@ class DocumentProcessor:
         extract_images: bool = True
     ) -> None:
         """Process document and generate embeddings."""
-        # Extract text and images from document
+        # Extract elements from document
         elements = partition(filename=file_path)
 
-        # Prepare inputs for ColQwen
+        # Prepare inputs for embedding generation
         texts = []
         images = []
         element_metadata = []
 
         for element in elements:
             if extract_images and element.type == "Image":
-                # Get image bytes
-                image_bytes = element.image_data
+                # Generate CLIP embedding for image
+                image_embedding = self.clip_model.encode(element.image_data)
+                
+                # Store image embedding
+                await self.vector_store.store_image_embedding(
+                    file_id=file_id,
+                    embedding=image_embedding,
+                    metadata={
+                        **metadata,
+                        "element_type": "image",
+                        "coordinates": element.metadata.get("coordinates"),
+                        "page_number": element.metadata.get("page_number")
+                    }
+                )
+                
                 # Get surrounding text context
                 context = element.context or ""
-
                 texts.append(context)
-                images.append(image_bytes)
                 element_metadata.append({
                     **metadata,
-                    "element_type": "image",
-                    "context": context
+                    "element_type": "image_context",
+                    "coordinates": element.metadata.get("coordinates")
                 })
+            
+            elif element.type == "Table":
+                # Convert table to text representation
+                table_text = element.metadata.get("text_as_html", "")
+                text_chunks = self.text_splitter.split_text(table_text)
+                texts.extend(text_chunks)
+                element_metadata.extend([{
+                    **metadata,
+                    "element_type": "table",
+                    "coordinates": element.metadata.get("coordinates"),
+                    "chars": len(chunk),
+                    "tokens": len(chunk.split())
+                } for chunk in text_chunks])
+            
             else:
+                # Process regular text
                 text = str(element)
                 text_chunks = self.text_splitter.split_text(text)
                 texts.extend(text_chunks)
-                images.extend([None] * len(text_chunks))
                 element_metadata.extend([{
                     **metadata,
                     "element_type": "text",
@@ -979,11 +1065,10 @@ class DocumentProcessor:
                     "tokens": len(chunk.split())
                 } for chunk in text_chunks])
 
-        # Store embeddings in vector store
+        # Store text embeddings
         await self.vector_store.store_embeddings(
             file_id=file_id,
             texts=texts,
-            images=images,
             metadata=element_metadata
         )
 
@@ -995,12 +1080,24 @@ class DocumentProcessor:
         limit: int = 5
     ) -> List[Dict]:
         """Query documents using multimodal search."""
-        return await self.vector_store.hybrid_search(
-            query_text=query,
-            query_image=query_image,
-            filters=filters,
-            limit=limit
-        )
+        if query_image:
+            # Generate CLIP embedding for query image
+            image_embedding = self.clip_model.encode(Image.open(io.BytesIO(query_image)))
+            
+            # Perform hybrid image-text search
+            return await self.vector_store.hybrid_search(
+                query_text=query,
+                query_image_embedding=image_embedding,
+                filters=filters,
+                limit=limit
+            )
+        else:
+            # Perform text-only search
+            return await self.vector_store.hybrid_search(
+                query_text=query,
+                filters=filters,
+                limit=limit
+            )
 ```
 
 ### SQL Functions for Text Search
@@ -1080,7 +1177,7 @@ results = await doc_processor.query_documents(
 # Use results in RAG
 context = "\n\n".join([r['metadata']['content'] for r in results])
 response = await openai_client.chat.completions.create(
-    model="gpt-4-turbo-preview",
+    model="gpt-4o",
     messages=[
         {"role": "system", "content": "Answer based on the provided context."},
         {"role": "user", "content": f"Context:\n{context}\n\nQuestion: What is shown in this image?"}
